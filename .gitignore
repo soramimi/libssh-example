@@ -1,0 +1,7 @@
+build/
+*.user
+main.d
+main.o
+myapp
+
+
