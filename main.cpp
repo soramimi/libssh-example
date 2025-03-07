@@ -36,6 +36,11 @@ public:
 		{
 			ssh_options_set(session, SSH_OPTIONS_USER, auth.uid.c_str());
 			return ssh_userauth_password(session, NULL, auth.pwd.c_str());
+			if (auth.pwd.empty()) {
+i				return ssh_userauth_none(session, NULL);
+			} else {
+				return ssh_userauth_password(session, NULL, auth.pwd.c_str());
+			}
 		}
 
 		int operator () (PubkeyAuth &auth)
