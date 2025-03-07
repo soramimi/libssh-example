@@ -1,4 +1,5 @@
 #include <libssh/libssh.h>
+#include <libssh/sftp.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +7,7 @@
 #include <sys/stat.h>
 #include <variant>
 #include <string>
+#include <fcntl.h>
 
 #define HOST "127.0.0.1"
 #define LOCAL_FILE "example.txt"
@@ -37,7 +39,7 @@ public:
 			ssh_options_set(session, SSH_OPTIONS_USER, auth.uid.c_str());
 			return ssh_userauth_password(session, NULL, auth.pwd.c_str());
 			if (auth.pwd.empty()) {
-i				return ssh_userauth_none(session, NULL);
+				return ssh_userauth_none(session, NULL);
 			} else {
 				return ssh_userauth_password(session, NULL, auth.pwd.c_str());
 			}
@@ -152,7 +154,7 @@ public:
 		return exec(session_, cmd);
 	}
 
-	bool push_file()
+	bool push_file_scp() // scp is deprecated
 	{
 		std::string dir = "/tmp";
 		std::string filename = "example.txt";
@@ -189,6 +191,159 @@ public:
 		return true;
 	}
 
+	bool push_file_sftp()
+	{
+		std::string filename = "/tmp/example.txt";
+		std::string data = "Hello, world";
+
+		sftp_session sftp;
+		sftp_file file;
+		int rc;
+
+		// SFTPセッションを初期化
+		sftp = sftp_new(session_);
+		if (!sftp) {
+			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(session_));
+			return false;
+		}
+
+		// SFTPセッションを開く
+		rc = sftp_init(sftp);
+		if (rc != SSH_OK) {
+			fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(session_));
+			sftp_free(sftp);
+			return false;
+		}
+
+		// ファイルをリモートサーバにコピー
+		file = sftp_open(sftp, filename.c_str(), O_WRONLY | O_CREAT, 0644);
+		if (!file) {
+			fprintf(stderr, "Failed to open file: %s\n", ssh_get_error(session_));
+			sftp_free(sftp);
+			return false;
+		}
+
+
+		ssize_t nbytes;
+		nbytes = sftp_write(file, data.c_str(), data.size());
+
+		sftp_close(file);
+		sftp_free(sftp);
+
+		fprintf(stderr, "File transferred successfully.\n");
+		return true;
+	}
+
+	bool pull_file_scp() // scp is deprecated
+	{
+		std::string remote_file = "/tmp/example.txt";
+
+		char buffer[1024];
+		int nbytes;
+		int total = 0;
+
+		// SCPセッションの初期化
+		scp_ = ssh_scp_new(session_, SSH_SCP_READ, remote_file.c_str());
+		if (scp_ == NULL) {
+			fprintf(stderr, "Error initializing SCP session: %s\n", ssh_get_error(session_));
+			return false;
+		}
+		flags_ |= SCP_ALLOCATED;
+
+		if (ssh_scp_init(scp_) != SSH_OK) {
+			fprintf(stderr, "Error initializing SCP: %s\n", ssh_get_error(session_));
+			ssh_scp_free(scp_);
+			return false;
+		}
+		flags_ |= SCP_OPENED;
+
+		int rc;
+		rc = ssh_scp_pull_request(scp_);
+		if (rc != SSH_SCP_REQUEST_NEWFILE) {
+			fprintf(stderr, "Error requesting file: %s\n", ssh_get_error(session_));
+			return false;
+		}
+		auto size = ssh_scp_request_get_size(scp_);
+		auto *filename = ssh_scp_request_get_filename(scp_);
+		auto mode = ssh_scp_request_get_permissions(scp_);
+
+		// リモートファイルの受け入れ
+		if (ssh_scp_accept_request(scp_) != SSH_OK) {
+			fprintf(stderr, "Error accepting SCP request: %s\n", ssh_get_error(session_));
+			return false;
+		}
+
+		//
+		total = 0;
+		while (total < size) {
+			nbytes = ssh_scp_read(scp_, buffer, size - total);
+			if (nbytes < 0) {
+				fprintf(stderr, "Error receiving file: %s\n", ssh_get_error(session_)); // エラーメッセージを表示
+				break;
+			}
+
+			// printf("%d\n", nbytes);
+			fwrite(buffer, 1, nbytes, stdout);
+			total += nbytes;
+		}
+
+		return true;
+	}
+
+	bool pull_file_sftp()
+	{
+		std::string remote_file = "/tmp/example.txt";
+
+		sftp_session sftp;
+		sftp_file file;
+		int rc;
+
+		// SFTPセッションを初期化
+		sftp = sftp_new(session_);
+		if (!sftp) {
+			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(session_));
+			return false;
+		}
+
+		// SFTPセッションを開く
+		rc = sftp_init(sftp);
+		if (rc != SSH_OK) {
+			fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(session_));
+			sftp_free(sftp);
+			return false;
+		}
+
+		// ファイルをリモートサーバからコピー
+		file = sftp_open(sftp, remote_file.c_str(), O_RDONLY, 0);
+		if (!file) {
+			fprintf(stderr, "Failed to open file: %s\n", ssh_get_error(session_));
+			sftp_free(sftp);
+			return false;
+		}
+
+		// ファイルの内容を読み取る
+		char buffer[1024];
+		int nbytes;
+		while ((nbytes = sftp_read(file, buffer, sizeof(buffer))) > 0) {
+			fwrite(buffer, 1, nbytes, stdout);
+		}
+
+		sftp_close(file);
+		sftp_free(sftp);
+
+		return true;
+	}
+
+	bool push_file()
+	{
+		return push_file_sftp();
+	}
+
+	bool pull_file()
+	{
+		return pull_file_sftp();
+	}
+
 	void close()
 	{
 		if (flags_ & CHANNEL_OPENED) {
@@ -223,8 +378,10 @@ int main()
 
 	SSH ssh;
 	ssh.open(authdata);
-	ssh.exec("uname -a");
-	ssh.push_file();
+	// ssh.exec("uname -a");
+	// ssh.push_file_sftp();
+	// ssh.pull_file_scp();
+	ssh.pull_file();
 	ssh.close();
 	return 0;
 }
