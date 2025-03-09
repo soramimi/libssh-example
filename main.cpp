@@ -8,6 +8,8 @@
 #include <variant>
 #include <string>
 #include <fcntl.h>
+#include <functional>
+#include <variant>
 
 #define HOST "127.0.0.1"
 #define LOCAL_FILE "example.txt"
@@ -58,16 +60,18 @@ public:
 private:
 	enum {
 		SESSION_ALLOCATED = 0x0001,
-		SESSION_OPENED = 0x0002,
-		SCP_ALLOCATED = 0x0004,
-		SCP_OPENED = 0x0008,
-		CHANNEL_ALLOCATED = 0x0010,
-		CHANNEL_OPENED = 0x0020,
+		SESSION_CONNECTED = 0x0002,
+		CHANNEL_ALLOCATED = 0x0004,
+		CHANNEL_OPENED = 0x0008,
+		SCP_ALLOCATED = 0x0010,
+		SCP_OPENED = 0x0020,
+		SFTP_ALLOCATED = 0x0040,
 	};
 	unsigned int flags_ = 0;
 	ssh_session session_ = nullptr;
 	ssh_channel channel_ = nullptr;
 	ssh_scp scp_ = nullptr;
+	sftp_session sftp_ = nullptr;
 
 	int exec(ssh_session session, const char *command)
 	{
@@ -138,7 +142,7 @@ public:
 			fprintf(stderr, "Error connecting to %s: %s\n", HOST, ssh_get_error(session_));
 			return false;
 		}
-		flags_ |= SESSION_OPENED;
+		flags_ |= SESSION_CONNECTED;
 
 		rc = Auth{session_}.auth(authdata);
 		if (rc != SSH_AUTH_SUCCESS) {
@@ -154,11 +158,17 @@ public:
 		return exec(session_, cmd);
 	}
 
-	bool push_file_scp() // scp is deprecated
+	bool push_file_scp(std::string const &path, std::function<int (char *ptr, int len)> reader, size_t size) // scp is deprecated
 	{
-		std::string dir = "/tmp";
-		std::string filename = "example.txt";
-		std::string data = "Hello, world";
+		std::string dir;
+		std::string name = path;
+		{
+			auto i = name.rfind('/');
+			if (i != std::string::npos) {
+				dir = name.substr(0, i);
+				name = name.substr(i + 1);
+			}
+		}
 
 		int rc;
 
@@ -176,26 +186,27 @@ public:
 			fprintf(stderr, "Failed to initialize SCP: %s\n", ssh_get_error(session_));
 			return false;
 		}
-		flags_ |= SCP_OPENED;
 
 		// SCPでファイルをリモートサーバにコピー
-		rc = ssh_scp_push_file(scp_, filename.c_str(), data.size(), 0644);
+		rc = ssh_scp_push_file(scp_, name.c_str(), size, 0644);
 		if (rc != SSH_OK) {
 			fprintf(stderr, "SCP push failed: %s\n", ssh_get_error(session_));
 			return false;
 		}
 
-		ssh_scp_write(scp_, data.c_str(), data.size());
+		while (1) {
+			char tmp[1024];
+			int nbytes = reader(tmp, sizeof(tmp));
+			if (nbytes < 1) break;
+			ssh_scp_write(scp_, tmp, nbytes);
+		}
 
 		fprintf(stderr, "File transferred successfully.\n");
 		return true;
 	}
 
-	bool push_file_sftp()
+	bool push_file_sftp(std::string const &path, std::function<int (char *ptr, int len)> reader)
 	{
-		std::string filename = "/tmp/example.txt";
-		std::string data = "Hello, world";
-
 		sftp_session sftp;
 		sftp_file file;
 		int rc;
@@ -206,6 +217,7 @@ public:
 			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(session_));
 			return false;
 		}
+		flags_ |= SCP_ALLOCATED;
 
 		// SFTPセッションを開く
 		rc = sftp_init(sftp);
@@ -216,16 +228,19 @@ public:
 		}
 
 		// ファイルをリモートサーバにコピー
-		file = sftp_open(sftp, filename.c_str(), O_WRONLY | O_CREAT, 0644);
+		file = sftp_open(sftp, path.c_str(), O_WRONLY | O_CREAT, 0644);
 		if (!file) {
 			fprintf(stderr, "Failed to open file: %s\n", ssh_get_error(session_));
 			sftp_free(sftp);
 			return false;
 		}
 
-
-		ssize_t nbytes;
-		nbytes = sftp_write(file, data.c_str(), data.size());
+		while (1) {
+			char tmp[1024];
+			int nbytes = reader(tmp, sizeof(tmp));
+			if (nbytes < 1) break;
+			sftp_write(file, tmp, nbytes);
+		}
 
 		sftp_close(file);
 		sftp_free(sftp);
@@ -234,7 +249,7 @@ public:
 		return true;
 	}
 
-	bool pull_file_scp() // scp is deprecated
+	bool pull_file_scp(std::function<bool (char const *ptr, int len)> writer) // scp is deprecated
 	{
 		std::string remote_file = "/tmp/example.txt";
 
@@ -252,10 +267,8 @@ public:
 
 		if (ssh_scp_init(scp_) != SSH_OK) {
 			fprintf(stderr, "Error initializing SCP: %s\n", ssh_get_error(session_));
-			ssh_scp_free(scp_);
 			return false;
 		}
-		flags_ |= SCP_OPENED;
 
 		int rc;
 		rc = ssh_scp_pull_request(scp_);
@@ -264,8 +277,8 @@ public:
 			return false;
 		}
 		auto size = ssh_scp_request_get_size(scp_);
-		auto *filename = ssh_scp_request_get_filename(scp_);
-		auto mode = ssh_scp_request_get_permissions(scp_);
+		// auto *filename = ssh_scp_request_get_filename(scp_);
+		// auto mode = ssh_scp_request_get_permissions(scp_);
 
 		// リモートファイルの受け入れ
 		if (ssh_scp_accept_request(scp_) != SSH_OK) {
@@ -283,17 +296,15 @@ public:
 			}
 
 			// printf("%d\n", nbytes);
-			fwrite(buffer, 1, nbytes, stdout);
+			if (writer(buffer, nbytes) < 1) break;
 			total += nbytes;
 		}
 
 		return true;
 	}
 
-	bool pull_file_sftp()
+	bool pull_file_sftp(std::string const &remote_path, std::function<int (char *ptr, int len)> writer)
 	{
-		std::string remote_file = "/tmp/example.txt";
-
 		sftp_session sftp;
 		sftp_file file;
 		int rc;
@@ -304,17 +315,17 @@ public:
 			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(session_));
 			return false;
 		}
+		flags_ |= SFTP_ALLOCATED;
 
 		// SFTPセッションを開く
 		rc = sftp_init(sftp);
 		if (rc != SSH_OK) {
 			fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(session_));
-			sftp_free(sftp);
 			return false;
 		}
 
 		// ファイルをリモートサーバからコピー
-		file = sftp_open(sftp, remote_file.c_str(), O_RDONLY, 0);
+		file = sftp_open(sftp, remote_path.c_str(), O_RDONLY, 0);
 		if (!file) {
 			fprintf(stderr, "Failed to open file: %s\n", ssh_get_error(session_));
 			sftp_free(sftp);
@@ -325,23 +336,103 @@ public:
 		char buffer[1024];
 		int nbytes;
 		while ((nbytes = sftp_read(file, buffer, sizeof(buffer))) > 0) {
-			fwrite(buffer, 1, nbytes, stdout);
+			if (writer(buffer, nbytes) < 1) break;
 		}
 
 		sftp_close(file);
-		sftp_free(sftp);
 
 		return true;
 	}
 
-	bool push_file()
+	bool push_file(std::string const &path, std::function<int (char *ptr, int len)> reader)
 	{
-		return push_file_sftp();
+		return push_file_sftp(path, reader);
 	}
 
-	bool pull_file()
+	bool pull_file(std::string const &remote_path, std::function<int (char const *ptr, int len)> writer)
 	{
-		return pull_file_sftp();
+		return pull_file_sftp(remote_path, writer);
+	}
+
+	struct ::stat stat(std::string const &path)
+	{
+		struct stat st;
+		sftp_attributes attr;
+		sftp_ = sftp_new(session_);
+		if (!sftp_) {
+			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(session_));
+			return st;
+		}
+		flags_ |= SFTP_ALLOCATED;
+
+		if (sftp_init(sftp_) != SSH_OK) {
+			fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(session_));
+			return st;
+		}
+
+		attr = sftp_stat(sftp_, path.c_str());
+		if (!attr) {
+			fprintf(stderr, "Failed to stat file: %s\n", ssh_get_error(session_));
+			sftp_free(sftp_);
+			return st;
+		}
+		st.st_size = attr->size;
+		st.st_mode = attr->permissions;
+		sftp_attributes_free(attr);
+
+		return st;
+	}
+private:
+	struct MKDIR {
+	};
+	struct RMDIR {
+	};
+	typedef std::variant<MKDIR, RMDIR> SftpCmd;
+	struct SftpSimpleCommand {
+		SSH *that;
+		std::string name_;
+		SftpSimpleCommand(SSH *that, std::string name)
+			: that(that)
+			, name_(name)
+		{
+		}
+		int operator () (MKDIR &cmd)
+		{
+			return sftp_mkdir(that->sftp_, name_.c_str(), 0755);
+		}
+		int operator () (RMDIR &cmd)
+		{
+			return sftp_rmdir(that->sftp_, name_.c_str());
+		}
+		int visit(SftpCmd &cmd)
+		{
+			that->sftp_ = sftp_new(that->session_);
+			if (!that->sftp_) {
+				fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(that->session_));
+				return false;
+			}
+			that->flags_ |= SFTP_ALLOCATED;
+
+			if (sftp_init(that->sftp_) != SSH_OK) {
+				fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(that->session_));
+				sftp_free(that->sftp_);
+				return false;
+			}
+			int rc = std::visit(*this, cmd);
+			return rc == SSH_OK;
+		}
+	};
+public:
+	bool mkdir(std::string const &name)
+	{
+		SftpCmd cmd = MKDIR{};
+		return SftpSimpleCommand{this, name}.visit(cmd);
+	}
+
+	bool rmdir(std::string const &name)
+	{
+		SftpCmd cmd = RMDIR{};
+		return SftpSimpleCommand{this, name}.visit(cmd);
 	}
 
 	void close()
@@ -358,7 +449,10 @@ public:
 		if (flags_ & SCP_ALLOCATED) {
 			ssh_scp_free(scp_);
 		}
-		if (flags_ & SESSION_OPENED) {
+		if (flags_ & SFTP_ALLOCATED) {
+			sftp_free(sftp_);
+		}
+		if (flags_ & SESSION_CONNECTED) {
 			ssh_disconnect(session_);
 		}
 		if (flags_ & SESSION_ALLOCATED) {
@@ -371,17 +465,36 @@ public:
 int main()
 {
 #if 0
-		SSH::AuthVar authdata = SSH::PasswdAuth{"user123", "pass123"};
+	SSH::AuthVar authdata = SSH::PasswdAuth{"user123", "pass123"};
 #else
-		SSH::AuthVar authdata = SSH::PubkeyAuth{};
+	SSH::AuthVar authdata = SSH::PubkeyAuth{};
 #endif
+
+	char const *data = "Hello, world";
+	int offset = 0;
+	int length = strlen(data);
+
+	auto Reader = [&data, &offset, length](char *ptr, int len) {
+		if (offset < length) {
+			int n = std::min(len, length - offset);
+			memcpy(ptr, data + offset, n);
+			offset += n;
+			return n;
+		}
+		return 0;
+	};
+
+	auto Writer = [](char const *ptr, int len) {
+		return fwrite(ptr, 1, len, stdout);
+	};
 
 	SSH ssh;
 	ssh.open(authdata);
-	// ssh.exec("uname -a");
-	// ssh.push_file_sftp();
-	// ssh.pull_file_scp();
-	ssh.pull_file();
+	ssh.exec("uname -a");
+	// ssh.mkdir("/tmp/hogehoge");
+	// ssh.rmdir("/tmp/hogehoge");
+	// ssh.push_file("/tmp/example.txt", Reader);
+	// ssh.pull_file("/tmp/example.txt", Writer);
 	ssh.close();
 	return 0;
 }
