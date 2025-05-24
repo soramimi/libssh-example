@@ -34,7 +34,7 @@ int main()
 
 	EasySSH ssh;
 	ssh.open(HOST, PORT, authdata);
-	ssh.exec("uname -a");
+	ssh.exec("uname -a", Writer);
 	// ssh.mkdir("/tmp/hogehoge");
 	// ssh.rmdir("/tmp/hogehoge");
 	// ssh.push_file("/tmp/example.txt", Reader);
