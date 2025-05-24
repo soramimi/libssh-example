@@ -11,6 +11,8 @@ LIBS += -lssh
 
 
 HEADERS += main.h \
-	include/EasySSH.h
+	include/EasySSH.h \
+	src/joinpath.h
 SOURCES += \
-	src/EasySSH.cpp
+	src/EasySSH.cpp \
+	src/joinpath.cpp

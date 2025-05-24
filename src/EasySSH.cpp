@@ -1,5 +1,26 @@
 #include "EasySSH.h"
 #include <fcntl.h>
+#include "../../src/joinpath.h"
+#include <sys/stat.h>
+#include <unistd.h>
+
+std::string to_string(ssh_string s)
+{
+	if (s) {
+		void *p = ssh_string_data(s);
+		size_t n = ssh_string_len(s);
+		return {(char const *)p, n};
+	}
+	return {};
+}
+
+std::string to_string(char const *s)
+{
+	if (s) {
+		return s;
+	}
+	return {};
+}
 
 struct EasySSH::Auth {
 
@@ -24,6 +45,7 @@ struct EasySSH::SftpSimpleCommand {
 };
 
 struct EasySSH::Private {
+	std::string error;
 	unsigned int flags = 0;
 	ssh_session session = nullptr;
 	ssh_channel channel = nullptr;
@@ -92,6 +114,11 @@ bool EasySSH::exec(ssh_session session, const char *command, std::function<bool 
 	return true;
 }
 
+void EasySSH::clear_error()
+{
+	m->error.clear();
+}
+
 bool EasySSH::open(char const *host, int port, AuthVar authdata)
 {
 	bool ret = false;
@@ -138,10 +165,7 @@ void EasySSH::close()
 		ssh_scp_free(m->scp);
 		m->scp = nullptr;
 	}
-	if (m->sftp) {
-		sftp_free(m->sftp);
-		m->sftp = nullptr;
-	}
+	close_sftp();
 	if (m->session) {
 		ssh_disconnect(m->session);
 		ssh_free(m->session);
@@ -214,11 +238,8 @@ bool EasySSH::push_file_scp(const std::string &path, std::function<int (char *, 
 	return true;
 }
 
-bool EasySSH::push_file_sftp(const std::string &path, std::function<int (char *, int)> reader)
+bool EasySSH::open_sftp()
 {
-	sftp_file file;
-	int rc;
-
 	if (!m->sftp) {
 		// SFTPセッションを初期化
 		m->sftp = sftp_new(m->session);
@@ -229,24 +250,63 @@ bool EasySSH::push_file_sftp(const std::string &path, std::function<int (char *,
 		// m->flags |= SFTP_ALLOCATED;
 
 		// SFTPセッションを開く
-		rc = sftp_init(m->sftp);
+		int rc = sftp_init(m->sftp);
 		if (rc != SSH_OK) {
 			fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(m->session));
 			// sftp_free(m->sftp);
 			return false;
 		}
 	}
+	return true;
+}
 
-#if 0
-	std::string filepath = path;
-	sftp_attributes st = sftp_stat(m->session, path.c_str());
-	if (st) {
-		sftp_attributes_free(st);
-	}
-#endif
+bool EasySSH::close_sftp()
+{
+	if (!m->sftp) return false;
+	sftp_free(m->sftp);
+	m->sftp = nullptr;
+	return true;
+}
+
+EasySSH::FileAttribute EasySSH::stat_sftp(const std::string &path)
+{
+	sftp_attributes st = sftp_stat(m->sftp, path.c_str());
+	if (!st) return {};
+
+	FileAttribute ret;
+	ret.name = to_string(st->name);
+	ret.longname = to_string(st->longname);
+	ret.flags = st->flags;
+	ret.type = st->type;
+	ret.size = st->size;
+	ret.uid = st->uid;
+	ret.gid = st->gid;
+	ret.owner = to_string(st->owner);
+	ret.group = to_string(st->group);
+	ret.permissions = st->permissions;
+	ret.atime64 = st->atime64;
+	ret.atime = st->atime;
+	ret.atime_nseconds = st->atime_nseconds;
+	ret.createtime = st->createtime;
+	ret.createtime_nseconds = st->createtime_nseconds;
+	ret.mtime64 = st->mtime64;
+	ret.mtime = st->mtime;
+	ret.mtime_nseconds = st->mtime_nseconds;
+	ret.acl = to_string(st->acl);
+	ret.extended_count = st->extended_count;
+	ret.extended_type = to_string(st->extended_type);
+	ret.extended_data = to_string(st->extended_data);
+
+	sftp_attributes_free(st);
+	return ret;
+}
+
+bool EasySSH::push_file_sftp(const std::string &path, std::function<int (char *, int)> reader)
+{
+	if (!open_sftp()) return false;
 
 	// ファイルをリモートサーバにコピー
-	file = sftp_open(m->sftp, path.c_str(), O_WRONLY | O_CREAT, 0644);
+	sftp_file file = sftp_open(m->sftp, path.c_str(), O_WRONLY | O_CREAT, 0644);
 	if (!file) {
 		fprintf(stderr, "Failed to open file: %s\n", ssh_get_error(m->session));
 		// sftp_free(m->sftp);
@@ -459,4 +519,92 @@ int EasySSH::SftpSimpleCommand::visit(SftpCmd &cmd)
 	}
 	int rc = std::visit(*this, cmd);
 	return rc == SSH_OK;
+}
+
+bool EasySSH::SFTP::push(const std::string &local_path, std::string remote_path)
+{
+	ssh_.clear_error();
+
+	auto Do = [&]()->bool{
+		std::string basename;
+		{
+			auto it = local_path.rfind('/');
+			basename = it == std::string::npos ? local_path : local_path.substr(it + 1);
+		}
+		{
+			auto Split = [&](std::string const &remote_path){
+				std::vector<std::string> parts;
+				char const *begin = remote_path.c_str();
+				char const *end = begin + remote_path.size();
+				char const *left = begin;
+				char const *right = begin;
+				while (1) {
+					int c = 0;
+					if (right < end) {
+						c = (unsigned char)*right;
+					}
+					if (c == '/' || c == 0) {
+						parts.emplace_back(left, right - left);
+						if (c == 0) break;
+						right++;
+						left = right;
+					} else {
+						right++;
+					}
+				}
+				return parts;
+			};
+
+			std::vector<std::string> parts = Split(remote_path);
+			if (parts.empty()) {
+				ssh_.m->error = "Invalid remote path: ";
+				ssh_.m->error += remote_path;
+				return false;
+			}
+			if (!parts.back().empty()) {
+				basename = parts.back();
+			}
+			parts.pop_back();
+
+			remote_path = {};
+			for (size_t i = 0; i < parts.size(); i++) {
+				remote_path = remote_path / parts[i];
+				auto atts = stat(remote_path.c_str());
+				if (atts.isdir()) continue;
+				if (!ssh_.mkdir(remote_path)) {
+					ssh_.m->error = "Failed to create remote directory: ";
+					ssh_.m->error += remote_path;
+					return false;
+				}
+			}
+			remote_path = remote_path / basename;
+		}
+
+		struct stat st;
+		if (::stat(local_path.c_str(), &st) == 0) {
+			int fd = ::open(local_path.c_str(), O_RDONLY);
+			if (!fd) {
+				ssh_.m->error = "Failed to open local file: ";
+				ssh_.m->error += local_path;
+				return false;
+			}
+			auto Reader = [&](char *ptr, int len) {
+				int n = ::read(fd, ptr, len);
+				return n;
+			};
+			bool r = push(remote_path.c_str(), Reader);
+			::close(fd);
+			return r;
+		} else {
+			ssh_.m->error = "Failed to stat local file: ";
+			ssh_.m->error += local_path;
+			return false;
+		}
+	};
+
+	bool r = Do();
+	if (!r) {
+		fprintf(stderr, "%s\n", ssh_.m->error.c_str());
+	}
+	return r;
 }
