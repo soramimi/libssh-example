@@ -2,6 +2,7 @@
 
 
 #define HOST "127.0.0.1"
+#define PORT 22
 #define LOCAL_FILE "example.txt"
 #define REMOTE_PATH "/tmp/example.txt"
 
@@ -32,7 +33,7 @@ int main()
 	};
 
 	EasySSH ssh;
-	ssh.open(HOST, authdata);
+	ssh.open(HOST, PORT, authdata);
 	ssh.exec("uname -a");
 	// ssh.mkdir("/tmp/hogehoge");
 	// ssh.rmdir("/tmp/hogehoge");

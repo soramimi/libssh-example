@@ -22,20 +22,30 @@ public:
 
 	struct Auth;
 private:
-	enum {
-		SESSION_ALLOCATED = 0x0001,
-		SESSION_CONNECTED = 0x0002,
-		CHANNEL_ALLOCATED = 0x0004,
-		CHANNEL_OPENED = 0x0008,
-		SCP_ALLOCATED = 0x0010,
-		SCP_OPENED = 0x0020,
-		SFTP_ALLOCATED = 0x0040,
-	};
+	// enum {
+	// 	SESSION_ALLOCATED = 0x0001,
+	// 	SESSION_CONNECTED = 0x0002,
+	// 	CHANNEL_ALLOCATED = 0x0004,
+	// 	CHANNEL_OPENED = 0x0008,
+	// 	SCP_ALLOCATED = 0x0010,
+	// 	SCP_OPENED = 0x0020,
+	// 	SFTP_ALLOCATED = 0x0040,
+	// };
 
 	struct Private;
 	Private *m;
 
-	int exec(ssh_session session, const char *command);
+	struct MKDIR {
+	};
+	struct RMDIR {
+	};
+	typedef std::variant<MKDIR, RMDIR> SftpCmd;
+	struct SftpSimpleCommand;
+
+	bool exec(ssh_session session, const char *command, std::function<bool (const char *, int)> writer);
+
+	void close_scp();
+	void close_sftp();
 public:
 	EasySSH();
 	~EasySSH();
@@ -44,8 +54,13 @@ public:
 	EasySSH(EasySSH &&) = delete;
 	EasySSH &operator=(EasySSH &&) = delete;
 
-	bool open(const char *host, AuthVar authdata);
-	bool exec(char const *cmd);
+	bool open(const char *host, int port, AuthVar authdata);
+	void close();
+
+	bool mkdir(std::string const &name);
+	bool rmdir(std::string const &name);
+
+	bool exec(char const *cmd, std::function<bool (const char *, int)> writer);
 	bool push_file_scp(std::string const &path, std::function<int (char *ptr, int len)> reader, size_t size);
 	bool push_file_sftp(std::string const &path, std::function<int (char *ptr, int len)> reader);
 	bool pull_file_scp(std::function<bool (char const *ptr, int len)> writer);
@@ -53,19 +68,6 @@ public:
 	bool push_file(std::string const &path, std::function<int (char *ptr, int len)> reader);
 	bool pull_file(std::string const &remote_path, std::function<int (char const *ptr, int len)> writer);
 	struct stat stat(std::string const &path);
-private:
-	struct MKDIR {
-	};
-	struct RMDIR {
-	};
-	typedef std::variant<MKDIR, RMDIR> SftpCmd;
-	struct SftpSimpleCommand;
-public:
-	bool mkdir(std::string const &name);
-
-	bool rmdir(std::string const &name);
-
-	void close();
 };
 
 

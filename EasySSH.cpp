@@ -42,7 +42,7 @@ EasySSH::~EasySSH()
 	delete m;
 }
 
-int EasySSH::exec(ssh_session session, const char *command)
+bool EasySSH::exec(ssh_session session, const char *command, std::function<bool (const char *, int)> writer)
 {
 	int rc;
 	char buffer[256];
@@ -52,7 +52,7 @@ int EasySSH::exec(ssh_session session, const char *command)
 	m->channel = ssh_channel_new(session);
 	if (m->channel == NULL) {
 		fprintf(stderr, "Failed to create SSH channel\n");
-		return SSH_ERROR;
+		return false;
 	}
 
 	// チャネルを開く
@@ -61,7 +61,8 @@ int EasySSH::exec(ssh_session session, const char *command)
 		fprintf(stderr, "Failed to open SSH channel: %s\n", ssh_get_error(session));
 		// ssh_channel_free(channel);
 		// return rc;
-		goto free_channel;
+		// goto free_channel;
+		return false;
 	}
 
 	// コマンドの実行
@@ -71,25 +72,27 @@ int EasySSH::exec(ssh_session session, const char *command)
 		// ssh_channel_close(channel);
 		// ssh_channel_free(channel);
 		// return rc;
-		goto close_channel;
+		// goto close_channel;
+		return false;
 	}
 
 	// コマンド結果を読み取る
 	while ((nbytes = ssh_channel_read(m->channel, buffer, sizeof(buffer), 0)) > 0) {
-		fwrite(buffer, 1, nbytes, stdout);
+		writer(buffer, nbytes);
+		// fwrite(buffer, 1, nbytes, stdout);
 	}
 
 	// チャネルのクローズと解放
-	ssh_channel_send_eof(m->channel);
-close_channel:
-	ssh_channel_close(m->channel);
-free_channel:
-	ssh_channel_free(m->channel);
+// 	ssh_channel_send_eof(m->channel);
+// close_channel:
+// 	ssh_channel_close(m->channel);
+// free_channel:
+// 	ssh_channel_free(m->channel);
 
-	return SSH_OK;
+	return true;
 }
 
-bool EasySSH::open(char const *host, AuthVar authdata)
+bool EasySSH::open(char const *host, int port, AuthVar authdata)
 {
 	bool ret = false;
 	int rc;
@@ -100,10 +103,11 @@ bool EasySSH::open(char const *host, AuthVar authdata)
 		fprintf(stderr, "Failed to create SSH session.\n");
 		return false;
 	}
-	m->flags |= SESSION_ALLOCATED;
+	// m->flags |= SESSION_ALLOCATED;
 
 	// サーバのホスト情報の設定
 	ssh_options_set(m->session, SSH_OPTIONS_HOST, host);
+	ssh_options_set(m->session, SSH_OPTIONS_PORT, &port);
 
 	// サーバへ接続
 	rc = ssh_connect(m->session);
@@ -111,7 +115,7 @@ bool EasySSH::open(char const *host, AuthVar authdata)
 		fprintf(stderr, "Error connecting to %s: %s\n", host, ssh_get_error(m->session));
 		return false;
 	}
-	m->flags |= SESSION_CONNECTED;
+	// m->flags |= SESSION_CONNECTED;
 
 	rc = Auth{m->session}.auth(authdata);
 	if (rc != SSH_AUTH_SUCCESS) {
@@ -124,34 +128,43 @@ bool EasySSH::open(char const *host, AuthVar authdata)
 
 void EasySSH::close()
 {
-	if (m->flags & CHANNEL_OPENED) {
+	if (m->channel) {
 		ssh_channel_close(m->channel);
-	}
-	if (m->flags & CHANNEL_ALLOCATED) {
 		ssh_channel_free(m->channel);
+		m->channel = nullptr;
 	}
-	if (m->flags & SCP_OPENED) {
+	if (m->scp) {
 		ssh_scp_close(m->scp);
-	}
-	if (m->flags & SCP_ALLOCATED) {
 		ssh_scp_free(m->scp);
+		m->scp = nullptr;
 	}
-	if (m->flags & SFTP_ALLOCATED) {
+	if (m->sftp) {
 		sftp_free(m->sftp);
+		m->sftp = nullptr;
 	}
-	if (m->flags & SESSION_CONNECTED) {
+	if (m->session) {
 		ssh_disconnect(m->session);
-	}
-	if (m->flags & SESSION_ALLOCATED) {
 		ssh_free(m->session);
+		m->session = nullptr;
 	}
 	m->flags = 0;
 }
 
-
-bool EasySSH::exec(const char *cmd)
+bool EasySSH::mkdir(const std::string &name)
 {
-	return exec(m->session, cmd);
+	SftpCmd cmd = MKDIR{};
+	return SftpSimpleCommand{this, name}.visit(cmd);
+}
+
+bool EasySSH::rmdir(const std::string &name)
+{
+	SftpCmd cmd = RMDIR{};
+	return SftpSimpleCommand{this, name}.visit(cmd);
+}
+
+bool EasySSH::exec(const char *cmd, std::function<bool (const char *, int)> writer)
+{
+	return exec(m->session, cmd, writer);
 }
 
 bool EasySSH::push_file_scp(const std::string &path, std::function<int (char *, int)> reader, size_t size) // scp is deprecated
@@ -174,7 +187,7 @@ bool EasySSH::push_file_scp(const std::string &path, std::function<int (char *, 
 		fprintf(stderr, "Failed to create SCP session: %s\n", ssh_get_error(m->session));
 		return false;
 	}
-	m->flags |= SCP_ALLOCATED;
+	// m->flags |= SCP_ALLOCATED;
 
 	// SCPセッションを開く
 	rc = ssh_scp_init(m->scp);
@@ -203,31 +216,40 @@ bool EasySSH::push_file_scp(const std::string &path, std::function<int (char *, 
 
 bool EasySSH::push_file_sftp(const std::string &path, std::function<int (char *, int)> reader)
 {
-	sftp_session sftp;
 	sftp_file file;
 	int rc;
 
-	// SFTPセッションを初期化
-	sftp = sftp_new(m->session);
-	if (!sftp) {
-		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
-		return false;
-	}
-	m->flags |= SCP_ALLOCATED;
+	if (!m->sftp) {
+		// SFTPセッションを初期化
+		m->sftp = sftp_new(m->session);
+		if (!m->sftp) {
+			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
+			return false;
+		}
+		// m->flags |= SFTP_ALLOCATED;
 
-	// SFTPセッションを開く
-	rc = sftp_init(sftp);
-	if (rc != SSH_OK) {
-		fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(m->session));
-		sftp_free(sftp);
-		return false;
+		// SFTPセッションを開く
+		rc = sftp_init(m->sftp);
+		if (rc != SSH_OK) {
+			fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(m->session));
+			// sftp_free(m->sftp);
+			return false;
+		}
 	}
+
+#if 0
+	std::string filepath = path;
+	sftp_attributes st = sftp_stat(m->session, path.c_str());
+	if (st) {
+		sftp_attributes_free(st);
+	}
+#endif
 
 	// ファイルをリモートサーバにコピー
-	file = sftp_open(sftp, path.c_str(), O_WRONLY | O_CREAT, 0644);
+	file = sftp_open(m->sftp, path.c_str(), O_WRONLY | O_CREAT, 0644);
 	if (!file) {
 		fprintf(stderr, "Failed to open file: %s\n", ssh_get_error(m->session));
-		sftp_free(sftp);
+		// sftp_free(m->sftp);
 		return false;
 	}
 
@@ -239,9 +261,7 @@ bool EasySSH::push_file_sftp(const std::string &path, std::function<int (char *,
 	}
 
 	sftp_close(file);
-	sftp_free(sftp);
 
-	fprintf(stderr, "File transferred successfully.\n");
 	return true;
 }
 
@@ -253,17 +273,19 @@ bool EasySSH::pull_file_scp(std::function<bool (const char *, int)> writer) // s
 	int nbytes;
 	int total = 0;
 
-	// SCPセッションの初期化
-	m->scp = ssh_scp_new(m->session, SSH_SCP_READ, remote_file.c_str());
-	if (m->scp == NULL) {
-		fprintf(stderr, "Error initializing SCP session: %s\n", ssh_get_error(m->session));
-		return false;
-	}
-	m->flags |= SCP_ALLOCATED;
+	if (!m->sftp) {
+		// SCPセッションの初期化
+		m->scp = ssh_scp_new(m->session, SSH_SCP_READ, remote_file.c_str());
+		if (m->scp == NULL) {
+			fprintf(stderr, "Error initializing SCP session: %s\n", ssh_get_error(m->session));
+			return false;
+		}
+		// m->flags |= SCP_ALLOCATED;
 
-	if (ssh_scp_init(m->scp) != SSH_OK) {
-		fprintf(stderr, "Error initializing SCP: %s\n", ssh_get_error(m->session));
-		return false;
+		if (ssh_scp_init(m->scp) != SSH_OK) {
+			fprintf(stderr, "Error initializing SCP: %s\n", ssh_get_error(m->session));
+			return false;
+		}
 	}
 
 	int rc;
@@ -311,7 +333,7 @@ bool EasySSH::pull_file_sftp(const std::string &remote_path, std::function<int (
 		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
 		return false;
 	}
-	m->flags |= SFTP_ALLOCATED;
+	// m->flags |= SFTP_ALLOCATED;
 
 	// SFTPセッションを開く
 	rc = sftp_init(sftp);
@@ -359,7 +381,7 @@ struct stat EasySSH::stat(const std::string &path)
 		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
 		return st;
 	}
-	m->flags |= SFTP_ALLOCATED;
+	// m->flags |= SFTP_ALLOCATED;
 
 	if (sftp_init(m->sftp) != SSH_OK) {
 		fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(m->session));
@@ -377,18 +399,6 @@ struct stat EasySSH::stat(const std::string &path)
 	sftp_attributes_free(attr);
 
 	return st;
-}
-
-bool EasySSH::mkdir(const std::string &name)
-{
-	SftpCmd cmd = MKDIR{};
-	return SftpSimpleCommand{this, name}.visit(cmd);
-}
-
-bool EasySSH::rmdir(const std::string &name)
-{
-	SftpCmd cmd = RMDIR{};
-	return SftpSimpleCommand{this, name}.visit(cmd);
 }
 
 EasySSH::Auth::Auth(ssh_session session)
@@ -440,7 +450,7 @@ int EasySSH::SftpSimpleCommand::visit(SftpCmd &cmd)
 		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(that->m->session));
 		return false;
 	}
-	that->m->flags |= SFTP_ALLOCATED;
+	// that->m->flags |= SFTP_ALLOCATED;
 
 	if (sftp_init(that->m->sftp) != SSH_OK) {
 		fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(that->m->session));
