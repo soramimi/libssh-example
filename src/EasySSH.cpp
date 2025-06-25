@@ -1,6 +1,6 @@
 #include "EasySSH.h"
 #include <fcntl.h>
-#include "../../src/joinpath.h"
+#include "joinpath.h"
 #include <sys/stat.h>
 
 #ifdef _MSC_VER
