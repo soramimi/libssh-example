@@ -1,7 +1,7 @@
 #include "EasySSH.h"
 
 
-#define HOST "127.0.0.1"
+#define HOST "192.168.0.10"
 #define PORT 22
 #define LOCAL_FILE "example.txt"
 #define REMOTE_PATH "/tmp/example.txt"

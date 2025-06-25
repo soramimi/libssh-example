@@ -2,7 +2,12 @@
 #include <fcntl.h>
 #include "../../src/joinpath.h"
 #include <sys/stat.h>
+
+#ifdef _MSC_VER
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 std::string to_string(ssh_string s)
 {
@@ -46,7 +51,6 @@ struct EasySSH::SftpSimpleCommand {
 
 struct EasySSH::Private {
 	std::string error;
-	unsigned int flags = 0;
 	ssh_session session = nullptr;
 	ssh_channel channel = nullptr;
 	ssh_scp scp = nullptr;
@@ -81,9 +85,6 @@ bool EasySSH::exec(ssh_session session, const char *command, std::function<bool 
 	rc = ssh_channel_open_session(m->channel);
 	if (rc != SSH_OK) {
 		fprintf(stderr, "Failed to open SSH channel: %s\n", ssh_get_error(session));
-		// ssh_channel_free(channel);
-		// return rc;
-		// goto free_channel;
 		return false;
 	}
 
@@ -91,25 +92,13 @@ bool EasySSH::exec(ssh_session session, const char *command, std::function<bool 
 	rc = ssh_channel_request_exec(m->channel, command);
 	if (rc != SSH_OK) {
 		fprintf(stderr, "Failed to execute command: %s\n", ssh_get_error(session));
-		// ssh_channel_close(channel);
-		// ssh_channel_free(channel);
-		// return rc;
-		// goto close_channel;
 		return false;
 	}
 
 	// コマンド結果を読み取る
 	while ((nbytes = ssh_channel_read(m->channel, buffer, sizeof(buffer), 0)) > 0) {
 		writer(buffer, nbytes);
-		// fwrite(buffer, 1, nbytes, stdout);
 	}
-
-	// チャネルのクローズと解放
-// 	ssh_channel_send_eof(m->channel);
-// close_channel:
-// 	ssh_channel_close(m->channel);
-// free_channel:
-// 	ssh_channel_free(m->channel);
 
 	return true;
 }
@@ -130,7 +119,6 @@ bool EasySSH::open(char const *host, int port, AuthVar authdata)
 		fprintf(stderr, "Failed to create SSH session.\n");
 		return false;
 	}
-	// m->flags |= SESSION_ALLOCATED;
 
 	// サーバのホスト情報の設定
 	ssh_options_set(m->session, SSH_OPTIONS_HOST, host);
@@ -142,7 +130,6 @@ bool EasySSH::open(char const *host, int port, AuthVar authdata)
 		fprintf(stderr, "Error connecting to %s: %s\n", host, ssh_get_error(m->session));
 		return false;
 	}
-	// m->flags |= SESSION_CONNECTED;
 
 	rc = Auth{m->session}.auth(authdata);
 	if (rc != SSH_AUTH_SUCCESS) {
@@ -171,7 +158,6 @@ void EasySSH::close()
 		ssh_free(m->session);
 		m->session = nullptr;
 	}
-	m->flags = 0;
 }
 
 bool EasySSH::mkdir(const std::string &name)
@@ -211,7 +197,6 @@ bool EasySSH::push_file_scp(const std::string &path, std::function<int (char *, 
 		fprintf(stderr, "Failed to create SCP session: %s\n", ssh_get_error(m->session));
 		return false;
 	}
-	// m->flags |= SCP_ALLOCATED;
 
 	// SCPセッションを開く
 	rc = ssh_scp_init(m->scp);
@@ -247,7 +232,6 @@ bool EasySSH::open_sftp()
 			fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
 			return false;
 		}
-		// m->flags |= SFTP_ALLOCATED;
 
 		// SFTPセッションを開く
 		int rc = sftp_init(m->sftp);
@@ -340,7 +324,6 @@ bool EasySSH::pull_file_scp(std::function<bool (const char *, int)> writer) // s
 			fprintf(stderr, "Error initializing SCP session: %s\n", ssh_get_error(m->session));
 			return false;
 		}
-		// m->flags |= SCP_ALLOCATED;
 
 		if (ssh_scp_init(m->scp) != SSH_OK) {
 			fprintf(stderr, "Error initializing SCP: %s\n", ssh_get_error(m->session));
@@ -393,7 +376,6 @@ bool EasySSH::pull_file_sftp(const std::string &remote_path, std::function<int (
 		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
 		return false;
 	}
-	// m->flags |= SFTP_ALLOCATED;
 
 	// SFTPセッションを開く
 	rc = sftp_init(sftp);
@@ -441,7 +423,6 @@ struct stat EasySSH::stat(const std::string &path)
 		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(m->session));
 		return st;
 	}
-	// m->flags |= SFTP_ALLOCATED;
 
 	if (sftp_init(m->sftp) != SSH_OK) {
 		fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(m->session));
@@ -510,7 +491,6 @@ int EasySSH::SftpSimpleCommand::visit(SftpCmd &cmd)
 		fprintf(stderr, "Failed to create SFTP session: %s\n", ssh_get_error(that->m->session));
 		return false;
 	}
-	// that->m->flags |= SFTP_ALLOCATED;
 
 	if (sftp_init(that->m->sftp) != SSH_OK) {
 		fprintf(stderr, "Failed to initialize SFTP: %s\n", ssh_get_error(that->m->session));
